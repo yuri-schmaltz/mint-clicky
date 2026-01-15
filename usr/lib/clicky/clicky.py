@@ -23,7 +23,20 @@ setproctitle.setproctitle("clicky")
 
 # i18n
 APP = 'clicky'
-LOCALE_DIR = "/usr/share/locale"
+
+# Dynamic path resolution
+script_dir = os.path.dirname(os.path.abspath(__file__))
+# Check if running locally or installed
+if os.path.exists(os.path.join(script_dir, "../../share/clicky")):
+     # Local development structure (usr/lib/clicky -> usr/share/clicky)
+     root_dir = os.path.abspath(os.path.join(script_dir, "../../.."))
+     LOCALE_DIR = os.path.join(root_dir, "usr/share/locale")
+     SHARE_DIR = os.path.join(root_dir, "usr/share/clicky")
+else:
+     # Installed system-wide
+     LOCALE_DIR = "/usr/share/locale"
+     SHARE_DIR = "/usr/share/clicky"
+
 locale.bindtextdomain(APP, LOCALE_DIR)
 gettext.bindtextdomain(APP, LOCALE_DIR)
 gettext.textdomain(APP)
@@ -35,6 +48,25 @@ class MyApplication(Gtk.Application):
     def __init__(self, application_id, flags):
         Gtk.Application.__init__(self, application_id=application_id, flags=flags)
         self.connect("activate", self.activate)
+        
+        # Add command line parsing
+        self.add_main_option("area", ord('a'), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, "Capture area", None)
+        self.add_main_option("screen", ord('s'), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, "Capture screen", None)
+        self.add_main_option("window", ord('w'), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, "Capture window", None)
+
+    def do_command_line(self, command_line):
+        options = command_line.get_options_dict()
+        self.cli_mode = None
+        
+        if options.contains("area"):
+            self.cli_mode = "area"
+        elif options.contains("screen"):
+            self.cli_mode = "screen"
+        elif options.contains("window"):
+            self.cli_mode = "window"
+            
+        self.activate()
+        return 0
 
     def activate(self, application):
         windows = self.get_windows()
@@ -43,9 +75,17 @@ class MyApplication(Gtk.Application):
             window.present()
             window.show()
         else:
+            # Check if we have a CLI mode set
+            cli_mode = getattr(self, 'cli_mode', None)
+            
             window = MainWindow(self)
             self.add_window(window.window)
-            window.window.show()
+            
+            if cli_mode:
+                # Direct capture mode
+                window.set_mode_and_capture(cli_mode)
+            else:
+                window.window.show()
 
 class MainWindow():
 
@@ -55,7 +95,7 @@ class MainWindow():
         self.settings = Gio.Settings(schema_id="org.x.clicky")
 
         # Main UI
-        gladefile = "/usr/share/clicky/clicky.ui"
+        gladefile = os.path.join(SHARE_DIR, "clicky.ui")
         self.builder = Gtk.Builder()
         self.builder.set_translation_domain(APP)
         self.builder.add_from_file(gladefile)
@@ -73,7 +113,7 @@ class MainWindow():
 
         # CSS
         provider = Gtk.CssProvider()
-        provider.load_from_path("/usr/share/clicky/clicky.css")
+        provider.load_from_path(os.path.join(SHARE_DIR, "clicky.css"))
         screen = Gdk.Display.get_default_screen(Gdk.Display.get_default())
         Gtk.StyleContext.add_provider_for_screen(screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -118,7 +158,8 @@ class MainWindow():
 
     def start_screenshot(self, widget):
         self.hide_window()
-        GObject.timeout_add(200, self.take_screenshot)
+        # Increased to 500ms to ensure compositor animations (fade-out) are complete
+        GObject.timeout_add(500, self.take_screenshot)
 
     def hide_window(self):
         self.window.hide()
@@ -140,10 +181,22 @@ class MainWindow():
             self.builder.get_object("screenshot_image").show()
             self.navigate_to("screenshot_page")
             self.show_window()
-        except:
+        except Exception as e:
             print(traceback.format_exc())
-            print("Fatal exception occured, quitting!")
-            sys.exit(1)
+            self.show_error_dialog(_("An error occurred during the screenshot:\n\n") + str(e))
+            self.show_window()
+
+    def show_error_dialog(self, message):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text=_("Screenshot Failed"),
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
 
     @idle_function
     def navigate_to(self, page, name=""):
@@ -153,8 +206,160 @@ class MainWindow():
             self.builder.get_object("go_back_button").show()
         self.stack.set_visible_child_name(page)
 
+    def set_mode_and_capture(self, mode):
+        # Map string mode to radio button or constant
+        if mode == "screen":
+            self.radio_mode_screen.set_active(True)
+        elif mode == "window":
+            self.radio_mode_window.set_active(True)
+        elif mode == "area":
+            self.radio_mode_area.set_active(True)
+            
+        # Start capture immediately
+        self.start_screenshot(None)
+
+    def set_canvas_mode(self, widget, mode):
+        self.canvas.current_tool = mode
+
+    def setup_canvas_ui(self):
+        # Get the container box
+        box = self.builder.get_object("screenshot_box")
+        
+        # Add Toolbar
+        toolbar = Gtk.Toolbar()
+        toolbar.set_style(Gtk.ToolbarStyle.ICONS)
+        
+        # Pen Tool
+        btn_pen = Gtk.ToolButton()
+        btn_pen.set_icon_name("document-edit-symbolic")
+        btn_pen.set_tooltip_text(_("Red Pen"))
+        btn_pen.connect("clicked", self.set_canvas_mode, "pen")
+        toolbar.insert(btn_pen, -1)
+        
+        # Highlighter Tool
+        btn_high = Gtk.ToolButton()
+        # Fallback icon if 'marker' not available
+        btn_high.set_icon_name("format-text-bold-symbolic") 
+        btn_high.set_tooltip_text(_("Yellow Highlighter"))
+        btn_high.connect("clicked", self.set_canvas_mode, "highlighter")
+        toolbar.insert(btn_high, -1)
+
+        # Blue/Eraser (Placeholder for now)
+        btn_blue = Gtk.ToolButton()
+        btn_blue.set_icon_name("content-loading-symbolic")
+        btn_blue.set_tooltip_text(_("Blue Pen"))
+        btn_blue.connect("clicked", self.set_canvas_mode, "eraser")
+        toolbar.insert(btn_blue, -1)
+        
+        toolbar.show_all()
+        box.pack_start(toolbar, False, False, 0)
+        box.reorder_child(toolbar, 0)
+        
+        # Replace Image with Canvas
+        self.old_image_widget = self.builder.get_object("screenshot_image")
+        self.old_image_widget.hide()
+        # We keep it in the hierarchy or remove it? Removing cleanly is better.
+        # But for safety, let's just create Canvas and pack it.
+        
+        from canvas import CanvasWidget
+        self.canvas = CanvasWidget()
+        self.canvas.set_size_request(400, 300) # Min size
+        self.canvas.show()
+        
+        box.pack_start(self.canvas, True, True, 0)
+        
+        # Add Save Button explicitly here if needed, or reuse existing flow if there's a save button.
+        # There isn't a save button in the UI XML shown (only placeholders or hidden).
+        # We need a Save button in the toolbar.
+        
+        btn_save = Gtk.ToolButton()
+        btn_save.set_icon_name("document-save-symbolic")
+        btn_save.set_tooltip_text(_("Save"))
+        btn_save.connect("clicked", self.save_canvas)
+        toolbar.insert(btn_save, -1)
+
+    def save_canvas(self, widget):
+        if not self.canvas: return
+        
+        pixbuf = self.canvas.get_result_pixbuf()
+        if pixbuf:
+            dialog = Gtk.FileChooserDialog(
+                title=_("Save Screenshot"),
+                parent=self.window,
+                action=Gtk.FileChooserAction.SAVE
+            )
+            dialog.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_SAVE, Gtk.ResponseType.OK
+            )
+            dialog.set_do_overwrite_confirmation(True)
+            dialog.set_current_name(_("Screenshot.png"))
+            
+            response = dialog.run()
+            if response == Gtk.ResponseType.OK:
+                filename = dialog.get_filename()
+                pixbuf.savev(filename, "png", [], [])
+            
+            dialog.destroy()
+
+
     def go_back(self, widget):
         self.navigate_to("main_page")
+
+    def copy_to_clipboard(self, pixbuf):
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_image(pixbuf)
+        clipboard.store()
+
+    def show_notification(self):
+        notification = Gio.Notification.new(_("Screenshot Saved"))
+        notification.set_body(_("Image copied to clipboard. Click to edit."))
+        notification.set_icon(Gio.ThemedIcon.new("clicky"))
+        
+        # Action to open window (default action)
+        # For simplicity, since the app is already running (hidden or showing), 
+        # clicking usually activates the app. We just need to ensure the window is shown.
+        
+        self.application.send_notification("screenshot-taken", notification)
+
+    def take_screenshot(self):
+        try:
+            options = Options(self.settings)
+            pixbuf = utils.capture_pixbuf(options)
+            
+            # Post-capture actions (Win 11 style)
+            if pixbuf:
+                self.copy_to_clipboard(pixbuf)
+                self.show_notification()
+                
+                # Setup Canvas Logic
+                if not hasattr(self, 'canvas'):
+                    self.setup_canvas_ui()
+                
+                self.canvas.set_pixbuf(pixbuf)
+                
+                # Resize window to fit image (optional, mostly for usability)
+                w = pixbuf.get_width()
+                h = pixbuf.get_height()
+                # Limit max size
+                if w > 1200: w = 1200
+                if h > 800: h = 800
+                self.canvas.set_size_request(w, h)
+                
+                self.navigate_to("screenshot_page")
+                self.show_window()
+        except Exception as e:
+            print(traceback.format_exc())
+            self.show_error_dialog(_("An error occurred during the screenshot:\n\n") + str(e))
+            self.show_window()
+
+    @idle_function
+    def navigate_to(self, page, name=""):
+        if page == "main_page":
+            self.builder.get_object("go_back_button").hide()
+        else:
+            self.builder.get_object("go_back_button").show()
+        self.stack.set_visible_child_name(page)
 
     def open_about(self, widget):
         dlg = Gtk.AboutDialog()
@@ -184,7 +389,7 @@ class MainWindow():
         dlg.show()
 
     def open_keyboard_shortcuts(self, widget):
-        gladefile = "/usr/share/clicky/shortcuts.ui"
+        gladefile = os.path.join(SHARE_DIR, "shortcuts.ui")
         builder = Gtk.Builder()
         builder.set_translation_domain(APP)
         builder.add_from_file(gladefile)
@@ -212,6 +417,6 @@ class MainWindow():
              pass
 
 if __name__ == "__main__":
-    application = MyApplication("org.x.clicky", Gio.ApplicationFlags.FLAGS_NONE)
-    application.run()
+    application = MyApplication("org.x.clicky", Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+    application.run(sys.argv)
 

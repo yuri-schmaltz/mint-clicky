@@ -5,10 +5,24 @@ import os
 import sys
 import gi
 import traceback
-import Xlib.display
+
 gi.require_version('GSound', '1.0')
-from gi.repository import Gtk, Gio, Gdk, GdkX11, GdkPixbuf, GLib, GSound
+try:
+    gi.require_version('Gtk', '3.0')
+except ValueError:
+    pass # Already set?
+
+from gi.repository import Gtk, Gio, Gdk, GdkPixbuf, GLib, GSound
 from common import *
+
+IS_X11_AVAILABLE = False
+try:
+    import Xlib.display
+    from gi.repository import GdkX11
+    IS_X11_AVAILABLE = True
+except (ImportError, ValueError):
+    # Running on Wayland or dependencies missing
+    print("X11 libraries not found or not applicable. X11 features disabled.")
 
 SCREENSHOT_WIDTH = -1
 SCREENSHOT_HEIGHT = 250
@@ -46,6 +60,59 @@ def capture_via_gnome_dbus(options):
             os.unlink(filename)
     except Exception as e:
         print(traceback.format_exc())
+
+    return pixbuf
+
+def capture_via_xdg_portal(options):
+    print("Attempting XDG Portal capture...")
+    pixbuf = None
+    try:
+        bus = dbus.SessionBus()
+        portal = bus.get_object('org.freedesktop.portal.Desktop', '/org/freedesktop/portal/desktop')
+        interface = dbus.Interface(portal, 'org.freedesktop.portal.Screenshot')
+        
+        # Prepare options
+        portal_opts = {
+            'handle_token': f'clicky_{GLib.random_int()}',
+            'interactive': False # Request immediate capture if possible
+        }
+        
+        # Call Screenshot method
+        request_path = interface.Screenshot("", portal_opts)
+        
+        # Wait for Response signal
+        loop = GLib.MainLoop()
+        result_uri = [None]
+        
+        def on_response(response, results):
+            # 0 = Success, 1 = User Cancelled, 2 = Error
+            if response == 0 and 'uri' in results:
+                result_uri[0] = results['uri']
+            loop.quit()
+
+        bus.add_signal_receiver(on_response,
+                                signal_name="Response",
+                                dbus_interface="org.freedesktop.portal.Request",
+                                path=request_path)
+                                
+        loop.run()
+        
+        if result_uri[0]:
+            # Convert URI (file://...) to local path
+            path = result_uri[0].replace("file://", "")
+            # Decode URL encoding if necessary, simpler approach for now:
+            from urllib.parse import unquote
+            path = unquote(path)
+            
+            if os.path.exists(path):
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                # Cleanup? The portal might save it to Pictures. 
+                # For this app, we might want to keep it or let the user decide.
+                # The generic logic tries to load a pixbuf.
+                
+    except Exception as e:
+        print(f"XDG Portal capture failed: {e}")
+        # print(traceback.format_exc())
 
     return pixbuf
 
@@ -360,9 +427,17 @@ def play_sound_effect():
 
 def capture_pixbuf(options):
     screenshot = None
+    
+    # 1. Try XDG Portal (Standard for Wayland/Sandboxed)
     if options.enable_dbus_method:
+         screenshot = capture_via_xdg_portal(options)
+
+    # 2. Try GNOME Shell DBus (Legacy GNOME)
+    if screenshot == None and options.enable_dbus_method:
         print("Capturing screenshot via GNOME Dbus...")
         screenshot = capture_via_gnome_dbus(options)
+
+    # 3. Try X11 (Legacy/Fallback)
     if screenshot == None:
         print("Capturing screenshot via X11...")
         screenshot = capture_via_x11(options)
